@@ -124,7 +124,7 @@ def main():
         
         # 计算带宽
         total_bytes = n_tokens * token_size
-        bandwidth_GBps = (total_bytes / 1e9) / avg_t
+        bandwidth_GBps = total_bytes/(1024*1024*1024*avg_t)
 
         # 打印结果
         print(f'[Rank {rank}] Bandwidth: {bandwidth_GBps:.2f} GB/s, '
