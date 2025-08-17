@@ -100,7 +100,7 @@ target_compile_options(pydatacopy PRIVATE
 
 # 12. 设置输出目录
 set_target_properties(pydatacopy PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 

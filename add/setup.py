@@ -13,6 +13,6 @@ setup(
         )
     ],
     # 指定已经编译好的 .so 文件路径
-    package_data={'': ['pydatacopy.cpython-312-x86_64-linux-gnu.so']},
+    package_data={'': ['build/pydatacopy.cpython-312-x86_64-linux-gnu.so']},
     include_package_data=True,
 )

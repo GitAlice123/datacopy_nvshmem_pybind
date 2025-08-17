@@ -6,19 +6,10 @@
 #include <torch/extension.h>
 #include <vector>
 #include <cstring>
+#include <atomic>
 #include "ibgda_device.cuh"
-
-// NVSHMEM 团队变量
-nvshmem_team_t cpu_rdma_team = NVSHMEM_TEAM_INVALID;
-nvshmem_team_config_t cpu_rdma_team_config;
-
-std::vector<uint8_t> get_unique_id() {
-    nvshmemx_uniqueid_t unique_id;
-    nvshmemx_get_uniqueid(&unique_id);
-    std::vector<uint8_t> result(sizeof(nvshmemx_uniqueid_t));
-    std::memcpy(result.data(), &unique_id, sizeof(nvshmemx_uniqueid_t));
-    return result;
-}
+#include "double_buffer_manager.h"
+__global__ void send_recv_clean_kernel(DoubleBufferState state, int dst_pe);
 
 __global__ void ibgda_initialize_recv_queue(int rank) {
     auto thread_idx = static_cast<int>(threadIdx.x);
@@ -49,21 +40,6 @@ int init_nvshmem(const std::vector<uint8_t> &root_unique_id_val, int rank, int w
     
     nvshmemx_set_attr_uniqueid_args(rank, world_size, &root_unique_id, &attr);
     nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
-    
-    if (world_size > NUM_MAX_NVL_PEERS) {
-        assert(cpu_rdma_team == NVSHMEM_TEAM_INVALID);
-        assert(world_size % NUM_MAX_NVL_PEERS == 0);
-        
-        nvshmem_team_split_strided(NVSHMEM_TEAM_WORLD, 
-                                   rank % NUM_MAX_NVL_PEERS, 
-                                   NUM_MAX_NVL_PEERS,
-                                   world_size / NUM_MAX_NVL_PEERS, 
-                                   &cpu_rdma_team_config, 
-                                   0, 
-                                   &cpu_rdma_team);
-        
-        assert(cpu_rdma_team != NVSHMEM_TEAM_INVALID);
-    }
 
     nvshmemi_device_host_state_t* dev_state_ptr = nullptr;
     CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&dev_state_ptr), nvshmemi_device_state_d));
@@ -77,82 +53,193 @@ int init_nvshmem(const std::vector<uint8_t> &root_unique_id_val, int rank, int w
     return nvshmem_my_pe();
 }
 
-// CUDA Kernel communicate using NET
-__global__ void cross_device_put_kernel(int* data, int target_pe, int rank) {
-    if (threadIdx.x == 0) {
-        nvshmem_barrier_all();
-        
-        if (rank == 0) {
-            int send_value = 12345;
-            
-            printf("[GPU0] Sending value %d to PE %d\n", send_value, target_pe);
-            
-            // nvshmem_int_p(data, send_value, target_pe);
-            // nvshmemi_ibgda_rma_p(int *rptr, const int value, int dst_pe, int qp_id, uint32_t imm = std::numeric_limits<uint32_t>::max())
-            datacopy::nvshmemi_ibgda_rma_p(reinterpret_cast<int*>(data), send_value, target_pe, 0);
-            
-            nvshmem_quiet();
-        }else{
-            // sleep for a while
-            auto cur_time = clock64();
-            while (clock64() - cur_time < 10000000) {
-                // busy wait
-            }
-        }
+
+std::vector<uint8_t> get_unique_id() {
+    nvshmemx_uniqueid_t unique_id;
+    nvshmemx_get_uniqueid(&unique_id);
+    std::vector<uint8_t> result(sizeof(nvshmemx_uniqueid_t));
+    std::memcpy(result.data(), &unique_id, sizeof(nvshmemx_uniqueid_t));
+    return result;
+}
+
+// 实现 DoubleBufferManager 的方法
+DoubleBufferManager::DoubleBufferManager() : initialized(false), n_tokens(0), token_size(0) {}
+
+DoubleBufferManager::~DoubleBufferManager() {
+    cleanup();
+}
+
+void DoubleBufferManager::init(int n_tokens, int token_size) {
+    if (initialized) {
+        cleanup();
+    }
+    this->n_tokens = n_tokens;
+    this->token_size = token_size;
+    init_double_buffer(&state, n_tokens, token_size);
+    initialized = true;
+}
+
+void DoubleBufferManager::cleanup() {
+    if (initialized) {
+        cleanup_double_buffer(&state);
+        initialized = false;
     }
 }
 
-void test_cross_device_comm(int* d_data, int rank, int world_size) {
-    int *h_data = (int*)malloc(sizeof(int));
-    *h_data = 0.0f;
+void DoubleBufferManager::test_bandwidth(int rank, int world_size) {
+    if (!initialized) {
+        throw std::runtime_error("DoubleBufferManager not initialized");
+    }
+    int dst_pe = (rank == 0) ? 1 : 0;
     
-    cudaMemset(d_data, 0, sizeof(int));
+    // 计算线程配置
+    int total_need_threads = n_tokens * 2;
+    int block_size = 256;
+    int grid_size = (total_need_threads + block_size - 1) / block_size;
     
-    int target_pe = (rank == 0) ? 1 : 0;
+    // 启动内核
+    send_recv_clean_kernel<<<grid_size, block_size>>>(state, dst_pe);
     
-    dim3 block(32, 1, 1);
-    dim3 grid(1, 1, 1);
-    cross_device_put_kernel<<<grid, block>>>(d_data, target_pe, rank);
-    
+    // 等待内核完成
     cudaDeviceSynchronize();
+
+    // 切换缓冲区
+    state.current_buffer = 1 - state.current_buffer;
+}
+
+void DoubleBufferManager::init_double_buffer(DoubleBufferState* state, int n_tokens, int token_size) {
+    state->n_tokens = n_tokens;
+    state->token_size = token_size;
+    state->current_buffer = 0;
     
-    cudaMemcpy(h_data, d_data, sizeof(int), cudaMemcpyDeviceToHost);
+    // 检查参数有效性
+    if (n_tokens <= 0 || token_size <= 0) {
+        fprintf(stderr, "Error: Invalid parameters: n_tokens=%d, token_size=%d\n", n_tokens, token_size);
+        exit(EXIT_FAILURE);
+    }
     
+    // 分配缓冲区0
+    state->buffer0_send = (char*)nvshmem_malloc(n_tokens * token_size);
+    state->buffer0_recv = (char*)nvshmem_malloc(n_tokens * token_size);
+    state->buffer0_signals = (volatile int*)nvshmem_malloc(n_tokens * sizeof(int));
+    
+    // 检查分配是否成功
+    if (!state->buffer0_send || !state->buffer0_recv || !state->buffer0_signals) {
+        fprintf(stderr, "Error: Failed to allocate buffer0\n");
+        exit(EXIT_FAILURE);
+    }
+    
+    // 分配缓冲区1
+    state->buffer1_send = (char*)nvshmem_malloc(n_tokens * token_size);
+    state->buffer1_recv = (char*)nvshmem_malloc(n_tokens * token_size);
+    state->buffer1_signals = (volatile int*)nvshmem_malloc(n_tokens * sizeof(int));
+    
+    if (!state->buffer1_send || !state->buffer1_recv || !state->buffer1_signals) {
+        fprintf(stderr, "Error: Failed to allocate buffer1\n");
+        exit(EXIT_FAILURE);
+    }
+
+    state->buffer_tmp_signals = (volatile int*)nvshmem_malloc(n_tokens * sizeof(int));
+    
+    if (!state->buffer_tmp_signals) {
+        fprintf(stderr, "Error: Failed to allocate buffer_tmp_signals\n");
+        exit(EXIT_FAILURE);
+    }
+    
+    // 在主机上创建临时缓冲区并初始化
+    int* host_signals = (int*)malloc(n_tokens * sizeof(int));
+    if (!host_signals) {
+        fprintf(stderr, "Error: Failed to allocate host_signals\n");
+        exit(EXIT_FAILURE);
+    }
+    
+    for (int i = 0; i < n_tokens; ++i) {
+        host_signals[i] = 0;
+    }
+    
+    // 使用 cudaMemcpy 将数据从主机复制到设备
+    cudaError_t err;
+    
+    err = cudaMemcpy((void*)state->buffer0_signals, host_signals, n_tokens * sizeof(int), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy error (buffer0_signals): %s\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+    
+    err = cudaMemcpy((void*)state->buffer1_signals, host_signals, n_tokens * sizeof(int), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy error (buffer1_signals): %s\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+    
+    err = cudaMemcpy((void*)state->buffer_tmp_signals, host_signals, n_tokens * sizeof(int), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy error (buffer_tmp_signals): %s\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+    
+    // 释放主机内存
+    free(host_signals);
+    
+    // 确保内存同步
     nvshmem_barrier_all();
+}
+
+void DoubleBufferManager::cleanup_double_buffer(DoubleBufferState* state) {
+    nvshmem_free(state->buffer0_send);
+    nvshmem_free(state->buffer0_recv);
+    nvshmem_free((void*)state->buffer0_signals);
     
-    if (rank == 0) {
-        printf("[GPU0] Test completed. Sent value: 12345\n");
+    nvshmem_free(state->buffer1_send);
+    nvshmem_free(state->buffer1_recv);
+    nvshmem_free((void*)state->buffer1_signals);
+
+    nvshmem_free((void*)state->buffer_tmp_signals);
+}
+
+// 内核函数实现
+__global__ void send_recv_clean_kernel(DoubleBufferState state, int dst_pe) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_threads = gridDim.x * blockDim.x;
+    
+    // 确定当前和下一个缓冲区
+    int current_idx = state.current_buffer;
+    int next_idx = 1 - current_idx;
+    
+    // 获取当前缓冲区指针
+    char* send_buffer = (current_idx == 0) ? state.buffer0_send : state.buffer1_send;
+    char* recv_buffer = (current_idx == 0) ? state.buffer0_recv : state.buffer1_recv;
+    volatile int* signals = (current_idx == 0) ? state.buffer0_signals : state.buffer1_signals;
+    
+    // 获取下一个缓冲区指针（用于清理）
+    volatile int* next_signals = (next_idx == 0) ? state.buffer0_signals : state.buffer1_signals;
+    
+    // 线程分组：前一半用于通信，后一半用于清理
+    int comm_threads = total_threads / 2;
+    int clean_threads = comm_threads;
+    
+    if (tid < comm_threads) {
+        // 通信线程：执行发送和接收
+        if (tid < state.n_tokens) {
+            // 发送数据
+            char* token_data_send = send_buffer + tid * state.token_size;
+            char* token_data_recv = recv_buffer + tid * state.token_size;
+            
+            datacopy::nvshmemi_ibgda_put_nbi_thread(
+                (uint64_t)token_data_recv, (uint64_t)token_data_send, state.token_size, dst_pe, tid, tid);
+            
+            // 发送信号
+            int signal = tid + 1;  // 信号值 = token 索引 + 1
+            datacopy::nvshmemi_ibgda_amo_nonfetch_add((void*)&signals[tid], signal, dst_pe, tid, false);
+            
+            // 轮询接收信号 - 使用直接访问而不是 __ldg
+            while (signals[tid] != tid + 1);
+        }
     } else {
-        const int expected = 12345;
-        const int tolerance = 1;
-        int received = *h_data;
-        
-        if (fabs(received - expected) < tolerance) {
-            printf("[GPU1] Test PASSED! Received value: %d\n", received);
-        } else {
-            printf("[GPU1] Test FAILED! Expected %d, got %d\n", expected, received);
+        // 清理线程：清理下一个缓冲区
+        int clean_tid = tid - comm_threads;
+        for(int i = clean_tid; i < state.n_tokens; i += clean_threads) {
+            next_signals[i] = 0; // 重置信号
         }
     }
-    
-    free(h_data);
-}
-
-void finalize_nvshmem() {
-    if (cpu_rdma_team != NVSHMEM_TEAM_INVALID) {
-        nvshmem_team_destroy(cpu_rdma_team);
-        cpu_rdma_team = NVSHMEM_TEAM_INVALID;
-    }
-    nvshmem_finalize();
-}
-
-void cuda_cross_device_test(int rank, int world_size, const std::vector<uint8_t>& root_unique_id) {
-    int my_pe = init_nvshmem(root_unique_id, rank, world_size);
-    printf("[NVSHMEM] Rank %d initialized as PE %d\n", rank, my_pe);
-    
-    int *d_data = (int*)nvshmem_malloc(sizeof(int));
-    
-    test_cross_device_comm(d_data, rank, world_size);
-    
-    nvshmem_free(d_data);
-    finalize_nvshmem();
 }

@@ -18,6 +18,3 @@ cmake .. \
     -Dpybind11_DIR=$(python3.12 -c "import pybind11; print(pybind11.get_cmake_dir())")
 
 ninja -j$(nproc)
-
-# 验证构建
-find . -name "pydatacopy*" -ls
