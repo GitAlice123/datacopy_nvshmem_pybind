@@ -1,9 +1,8 @@
 cmake_minimum_required(VERSION 3.18)
 project(pydatacopy LANGUAGES CXX CUDA)
 
-set(CMAKE_VERBOSE_MAKEFILE OFF)  # 关闭详细输出，除非需要调试
+set(CMAKE_VERBOSE_MAKEFILE OFF)
 
-# 启用 ccache 加速编译
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
     set(CMAKE_CXX_COMPILER_LAUNCHER ${CCACHE_PROGRAM})
@@ -11,36 +10,32 @@ if(CCACHE_PROGRAM)
     message(STATUS "Using ccache for compilation acceleration")
 endif()
 
-# 1. 查找 Python 开发库
 find_package(Python 3.12 REQUIRED COMPONENTS Interpreter Development)
 message(STATUS "Python include dirs: ${Python_INCLUDE_DIRS}")
 message(STATUS "Python libraries: ${Python_LIBRARIES}")
 
-# 2. 设置 Torch 路径
 set(TORCH_DIR "/usr/local/lib/python3.12/dist-packages/torch/share/cmake/Torch")
 message(STATUS "Using Torch at: ${TORCH_DIR}")
 list(APPEND CMAKE_PREFIX_PATH ${TORCH_DIR})
 
-# 关键修改：在查找 Torch 前设置架构
-# 设置 CUDA 架构为 90
 set(CMAKE_CUDA_ARCHITECTURES "90")
-set(TORCH_CUDA_ARCH_LIST "9.0")  # Torch 使用点分隔格式
+set(TORCH_CUDA_ARCH_LIST "9.0")
 
-# 查找 Torch
+
 find_package(Torch REQUIRED CONFIG)
 
-# 3. Pybind11 配置
+
 find_package(pybind11 REQUIRED CONFIG)
 
-# 4. NVSHMEM 配置
+
 set(NVSHMEM_HOME "/usr/local/nvshmem")
 message(STATUS "Using NVSHMEM at: ${NVSHMEM_HOME}")
 set(NVSHMEM_LIB "${NVSHMEM_HOME}/lib/libnvshmem.a")
 
-# 5. CUDA 配置
+
 find_package(CUDAToolkit REQUIRED)
 
-# 6. 添加源文件
+
 set(SOURCES 
     pybind_data_copy.cpp
     data_copy.cu
