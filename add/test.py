@@ -1,4 +1,3 @@
-# test.py
 import os
 import sys
 import time
@@ -37,6 +36,8 @@ def bench(fn, num_warmups=20, num_tests=30, post_fn=None):
     
     # 预热
     for _ in range(num_warmups):
+        # 预热时也同步，确保状态一致
+        dist.all_reduce(torch.tensor(0, device='cuda'))
         fn()
     
     # 刷新缓存
@@ -46,6 +47,10 @@ def bench(fn, num_warmups=20, num_tests=30, post_fn=None):
     # 测试
     times = []
     for _ in range(num_tests):
+        # 在计时前同步
+        dist.all_reduce(torch.tensor(0, device='cuda'))
+        torch.cuda.synchronize()  # 确保同步完成
+
         start_time = time.perf_counter()
         fn()
         torch.cuda.synchronize()
@@ -117,15 +122,17 @@ def main():
         
         # 定义测试函数
         def test_func():
+            # 在测试开始前同步所有GPU
+            dist.all_reduce(torch.tensor(0, device='cuda'))
             buffer_manager.test_bandwidth(rank, world_size)
         
         # 运行基准测试
         avg_t, min_t, max_t = bench(test_func)
         
         # 计算带宽
-        total_bytes = n_tokens * token_size
-        bandwidth_GBps = total_bytes/(1024*1024*1024*avg_t)
-
+        total_bytes = n_tokens * token_size * 2  # 双向通信
+        bandwidth_GBps = total_bytes / (1024**3 * avg_t)  # GB/s
+        
         # 打印结果
         print(f'[Rank {rank}] Bandwidth: {bandwidth_GBps:.2f} GB/s, '
               f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us', flush=True)
