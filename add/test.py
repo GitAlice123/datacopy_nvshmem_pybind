@@ -123,7 +123,7 @@ def main():
         avg_t, min_t, max_t = bench(test_func)
         
         # 计算带宽
-        total_bytes = n_tokens * token_size * 2  # 双向通信
+        total_bytes = n_tokens * token_size
         bandwidth_GBps = (total_bytes / 1e9) / avg_t
 
         # 打印结果
