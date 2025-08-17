@@ -1,0 +1,6 @@
+nvshmem_extension.cpp
+setup.py
+nvshmem_extension.egg-info/PKG-INFO
+nvshmem_extension.egg-info/SOURCES.txt
+nvshmem_extension.egg-info/dependency_links.txt
+nvshmem_extension.egg-info/top_level.txt
