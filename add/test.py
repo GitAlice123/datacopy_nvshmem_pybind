@@ -26,12 +26,20 @@ def init_dist(local_rank: int, num_local_ranks: int):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python test.py [local_rank]")
+        print("Usage: python test.py [local_rank] [num_qps_per_rank]")
         sys.exit(1)
     
     local_rank = int(sys.argv[1])
+    num_qps_per_rank = int(sys.argv[2])
     rank, world_size = init_dist(local_rank, 1)
     group = dist.new_group(list(range(world_size)))
+
+    os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
+    os.environ['NVSHMEM_DISABLE_P2P'] = '1'
+    os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
+    os.environ['NVSHMEM_IBGDA_NIC_HANDLER'] = 'gpu'
+    os.environ['NVSHMEM_QP_DEPTH'] = '1024'
+    os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'
     
     nvshmem_unique_ids = [None] * world_size
     

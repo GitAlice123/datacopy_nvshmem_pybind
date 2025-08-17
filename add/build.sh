@@ -20,4 +20,4 @@ cmake .. \
 ninja -j$(nproc)
 
 # 验证构建
-find . -name "pydatacopys*" -ls
+find . -name "pydatacopy*" -ls

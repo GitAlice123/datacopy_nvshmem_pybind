@@ -37,9 +37,11 @@ find_package(CUDAToolkit REQUIRED)
 
 
 set(SOURCES 
-    pybind_data_copy.cpp
-    data_copy.cu
+    src/pybind_data_copy.cpp
+    src/data_copy.cu
 )
+
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # 7. 获取 Python 模块后缀
 execute_process(
@@ -60,6 +62,7 @@ set_target_properties(pydatacopy PROPERTIES
 
 # 9. 添加包含目录
 target_include_directories(pydatacopy PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${Python_INCLUDE_DIRS}
     ${Torch_INCLUDE_DIRS}
     ${pybind11_INCLUDE_DIRS}

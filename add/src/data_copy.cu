@@ -6,6 +6,7 @@
 #include <torch/extension.h>
 #include <vector>
 #include <cstring>
+#include "ibgda_device.cuh"
 
 // NVSHMEM 团队变量
 nvshmem_team_t cpu_rdma_team = NVSHMEM_TEAM_INVALID;
@@ -19,6 +20,27 @@ std::vector<uint8_t> get_unique_id() {
     return result;
 }
 
+__global__ void ibgda_initialize_recv_queue(int rank) {
+    auto thread_idx = static_cast<int>(threadIdx.x);
+    auto num_threads = static_cast<int>(blockDim.x);
+
+    auto dst_rank = static_cast<int>(blockIdx.x);
+    if (dst_rank != rank) {
+        for (int qp_id = thread_idx; qp_id < datacopy::ibgda_get_state()->num_rc_per_pe; qp_id += num_threads) {
+            auto qp = datacopy::ibgda_get_rc(dst_rank, qp_id);
+
+            // Clean some necessary variables
+            for (int i = 0; i < qp->rx_wq.nwqes; ++ i)
+                datacopy::ibgda_write_empty_recv_wqe(datacopy::ibgda_get_wqe_ptr(qp, i));
+            qp->mvars.rx_wq.resv_head = 0;
+            qp->mvars.rx_wq.cons_idx = 0;
+
+            // Allocate receive slots
+            datacopy::nvshmemi_ibgda_allocate_recvs(qp);
+        }
+    }
+}
+
 int init_nvshmem(const std::vector<uint8_t> &root_unique_id_val, int rank, int world_size) {
     nvshmemx_uniqueid_t root_unique_id;
     nvshmemx_init_attr_t attr;
@@ -28,7 +50,6 @@ int init_nvshmem(const std::vector<uint8_t> &root_unique_id_val, int rank, int w
     nvshmemx_set_attr_uniqueid_args(rank, world_size, &root_unique_id, &attr);
     nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
     
-    const int NUM_MAX_NVL_PEERS = 8;
     if (world_size > NUM_MAX_NVL_PEERS) {
         assert(cpu_rdma_team == NVSHMEM_TEAM_INVALID);
         assert(world_size % NUM_MAX_NVL_PEERS == 0);
@@ -43,22 +64,32 @@ int init_nvshmem(const std::vector<uint8_t> &root_unique_id_val, int rank, int w
         
         assert(cpu_rdma_team != NVSHMEM_TEAM_INVALID);
     }
+
+    nvshmemi_device_host_state_t* dev_state_ptr = nullptr;
+    CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&dev_state_ptr), nvshmemi_device_state_d));
+
+    bool ibgda_is_initialized = false;
+    cudaMemcpy(&dev_state_ptr->ibgda_is_initialized, &ibgda_is_initialized, sizeof(bool), cudaMemcpyHostToDevice);    
+
+    ibgda_initialize_recv_queue<<<world_size, 128>>>(rank);
     
     nvshmem_barrier_all();
     return nvshmem_my_pe();
 }
 
 // CUDA Kernel communicate using NET
-__global__ void cross_device_put_kernel(float* data, int target_pe, int rank) {
+__global__ void cross_device_put_kernel(int* data, int target_pe, int rank) {
     if (threadIdx.x == 0) {
         nvshmem_barrier_all();
         
         if (rank == 0) {
-            float send_value = 3.14159f;
+            int send_value = 12345;
             
-            printf("[GPU0] Sending value %.5f to PE %d\n", send_value, target_pe);
+            printf("[GPU0] Sending value %d to PE %d\n", send_value, target_pe);
             
-            nvshmem_float_p(data, send_value, target_pe);
+            // nvshmem_int_p(data, send_value, target_pe);
+            // nvshmemi_ibgda_rma_p(int *rptr, const int value, int dst_pe, int qp_id, uint32_t imm = std::numeric_limits<uint32_t>::max())
+            datacopy::nvshmemi_ibgda_rma_p(reinterpret_cast<int*>(data), send_value, target_pe, 0);
             
             nvshmem_quiet();
         }else{
@@ -71,11 +102,11 @@ __global__ void cross_device_put_kernel(float* data, int target_pe, int rank) {
     }
 }
 
-void test_cross_device_comm(float* d_data, int rank, int world_size) {
-    float *h_data = (float*)malloc(sizeof(float));
+void test_cross_device_comm(int* d_data, int rank, int world_size) {
+    int *h_data = (int*)malloc(sizeof(int));
     *h_data = 0.0f;
     
-    cudaMemset(d_data, 0, sizeof(float));
+    cudaMemset(d_data, 0, sizeof(int));
     
     int target_pe = (rank == 0) ? 1 : 0;
     
@@ -85,21 +116,21 @@ void test_cross_device_comm(float* d_data, int rank, int world_size) {
     
     cudaDeviceSynchronize();
     
-    cudaMemcpy(h_data, d_data, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_data, d_data, sizeof(int), cudaMemcpyDeviceToHost);
     
     nvshmem_barrier_all();
     
     if (rank == 0) {
-        printf("[GPU0] Test completed. Sent value: %.5f\n", 3.14159f);
+        printf("[GPU0] Test completed. Sent value: 12345\n");
     } else {
-        const float expected = 3.14159f;
-        const float tolerance = 1e-5f;
-        float received = *h_data;
+        const int expected = 12345;
+        const int tolerance = 1;
+        int received = *h_data;
         
         if (fabs(received - expected) < tolerance) {
-            printf("[GPU1] Test PASSED! Received value: %.5f\n", received);
+            printf("[GPU1] Test PASSED! Received value: %d\n", received);
         } else {
-            printf("[GPU1] Test FAILED! Expected %.5f, got %.5f\n", expected, received);
+            printf("[GPU1] Test FAILED! Expected %d, got %d\n", expected, received);
         }
     }
     
@@ -118,7 +149,7 @@ void cuda_cross_device_test(int rank, int world_size, const std::vector<uint8_t>
     int my_pe = init_nvshmem(root_unique_id, rank, world_size);
     printf("[NVSHMEM] Rank %d initialized as PE %d\n", rank, my_pe);
     
-    float *d_data = (float*)nvshmem_malloc(sizeof(float));
+    int *d_data = (int*)nvshmem_malloc(sizeof(int));
     
     test_cross_device_comm(d_data, rank, world_size);
     
