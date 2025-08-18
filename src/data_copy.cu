@@ -220,7 +220,7 @@ __global__ void send_recv_clean_kernel(DoubleBufferState state, int dst_pe)
     volatile int *signals = (current_idx == 0) ? state.buffer0_signals : state.buffer1_signals;
     volatile int *signals_tmp = state.buffer_tmp_signals;
 
-    volatile int *next_signals = (next_idx == 0) ? state.buffer0_signals : state.buffer1_signals;
+    // volatile int *next_signals = (next_idx == 0) ? state.buffer0_signals : state.buffer1_signals;
 
     int comm_threads = total_threads / 2;
     int clean_threads = comm_threads;
@@ -234,64 +234,86 @@ __global__ void send_recv_clean_kernel(DoubleBufferState state, int dst_pe)
 
             datacopy::nvshmemi_ibgda_put_nbi_thread(
                 (uint64_t)token_data_recv, (uint64_t)token_data_send, state.token_size, dst_pe, tid, tid);
-            nvshmem_fence();
-            // send signal
-            uint32_t signal = (tid << 16) | 0x0001;
+            // nvshmemx_int8_put_nbi_warp((uint64_t)token_data_recv,
+            //                              (uint64_t)token_data_send,
+            //                              state.token_size,
+            //                              dst_pe);
+            // datacopy::ibgda_quiet(datacopy::ibgda_get_rc(dst_pe,tid));
+            // nvshmem_fence();
+            // --------------------------------------------------------------------------------------------
+            //                                        send signal
+            // --------------------------------------------------------------------------------------------
+            
+            // --------------------------------------atomic version----------------------------------------
+           
             // uint32_t signal = tid + 1;
-            // datacopy::nvshmemi_ibgda_amo_nonfetch_add((void *)&signals[tid], signal, dst_pe, tid, false);
-
-            datacopy::nvshmemi_ibgda_rma_p((int *)&signals_tmp[tid], 0, dst_pe, tid, signal);
-
+            // datacopy::nvshmemi_ibgda_amo_nonfetch_add((void *)&signals[tid], signal, dst_pe, tid);
+            datacopy::ibgda_quiet(datacopy::ibgda_get_rc(dst_pe,tid));
             // while (signals[tid] != tid + 1)
             //     ;
+            // datacopy::nvshmemi_ibgda_rma_p((int *)&signals_tmp[tid], 0, dst_pe, tid);
+            // datacopy::ibgda_quiet(datacopy::ibgda_get_rc(dst_pe,tid));
 
-            uint64_t cached_qp_cons_idx = 0;
-            uint64_t cached_qp_cons_idx_cur_base = 0;
-            // Get initial value from QP
-            nvshmemi_ibgda_device_qp_t *qp;
-            nvshmemi_ibgda_device_cq_t *cq;
-            struct mlx5_cqe64 *cqe64_base;
-            uint32_t ncqes;
-            qp = datacopy::ibgda_get_rc(dst_pe, 0);
-            cq = qp->rx_wq.cq;
-            cqe64_base = reinterpret_cast<struct mlx5_cqe64 *>(cq->cqe_base);
-            ncqes = cq->ncqes;
-            cached_qp_cons_idx = *cq->cons_idx;
-            cached_qp_cons_idx_cur_base = cached_qp_cons_idx;
+            // uint64_t cached_qp_cons_idx = 0;
+            // uint64_t cached_qp_cons_idx_cur_base = 0;
+            // // Get initial value from QP
+            // nvshmemi_ibgda_device_qp_t *qp;
+            // nvshmemi_ibgda_device_cq_t *cq;
+            // struct mlx5_cqe64 *cqe64_base;
+            // uint32_t ncqes;
+            // qp = datacopy::ibgda_get_rc(dst_pe, 0);
+            // cq = qp->rx_wq.cq;
+            // cqe64_base = reinterpret_cast<struct mlx5_cqe64 *>(cq->cqe_base);
+            // ncqes = cq->ncqes;
+            // cached_qp_cons_idx = *cq->cons_idx;
+            // cached_qp_cons_idx_cur_base = cached_qp_cons_idx;
 
-            auto *cqe64 = reinterpret_cast<struct mlx5_cqe64 *>(cqe64_base + cached_qp_cons_idx % ncqes);
-            auto pi = datacopy::HtoBE16(datacopy::ld_na_relaxed(&cqe64->wqe_counter));
-            int imm;
-            uint32_t token_index, flag;
-            // while ((static_cast<uint16_t>(cached_qp_cons_idx - pi - 1) < ncqes));
-            while (cached_qp_cons_idx < cached_qp_cons_idx_cur_base + (state.n_tokens))
-            {
-                while ((static_cast<uint16_t>(cached_qp_cons_idx - pi - 1) < ncqes)){
-                    pi = datacopy::HtoBE16(datacopy::ld_na_relaxed(&cqe64->wqe_counter));
-                }
-                imm = datacopy::HtoBE32(datacopy::ld_na_relaxed(&cqe64->imm_inval_pkey));
-                // printf("imm=%d\n", imm);
-                token_index = imm >> 16;
-                flag = imm & 0xFFFF;
-                // printf("token_idx=%d, flag=%d\n", token_index, flag);
-                if (token_index == tid && flag == 0x0001)
-                    break;
-                cached_qp_cons_idx++;
-                cqe64 = reinterpret_cast<struct mlx5_cqe64 *>(cqe64_base + cached_qp_cons_idx % ncqes);
-                // pi = datacopy::HtoBE16(datacopy::ld_na_relaxed(&cqe64->wqe_counter));
-            }
-            if (tid == comm_threads - 1)
-            {
-                *cq->cons_idx = cached_qp_cons_idx_cur_base + state.n_tokens;
-            }
+            // auto *cqe64 = reinterpret_cast<struct mlx5_cqe64 *>(cqe64_base + cached_qp_cons_idx % ncqes);
+            // auto pi = datacopy::HtoBE16(datacopy::ld_na_relaxed(&cqe64->wqe_counter));
+            // int imm;
+            // uint32_t token_index, flag;
+            // // while ((static_cast<uint16_t>(cached_qp_cons_idx - pi - 1) < ncqes));
+            // while (cached_qp_cons_idx < cached_qp_cons_idx_cur_base + (state.n_tokens))
+            // {
+            //     while ((static_cast<uint16_t>(cached_qp_cons_idx - pi - 1) < ncqes)){
+            //         pi = datacopy::HtoBE16(datacopy::ld_na_relaxed(&cqe64->wqe_counter));
+            //     }
+            //     imm = datacopy::HtoBE32(datacopy::ld_na_relaxed(&cqe64->imm_inval_pkey));
+            //     // printf("imm=%d\n", imm);
+            //     token_index = imm >> 16;
+            //     flag = imm & 0xFFFF;
+            //     // printf("token_idx=%d, flag=%d\n", token_index, flag);
+            //     if (token_index == tid && flag == 0x0001)
+            //         break;
+            //     cached_qp_cons_idx++;
+            //     cqe64 = reinterpret_cast<struct mlx5_cqe64 *>(cqe64_base + cached_qp_cons_idx % ncqes);
+            //     // pi = datacopy::HtoBE16(datacopy::ld_na_relaxed(&cqe64->wqe_counter));
+            // }
+            // if (tid == comm_threads - 1)
+            // {
+            //     *cq->cons_idx = cached_qp_cons_idx_cur_base + state.n_tokens;
+            // }
         }
+        // __syncthreads();
     }
     else
     {
-        int clean_tid = tid - comm_threads;
-        for (int i = clean_tid; i < state.n_tokens; i += clean_threads)
-        {
-            next_signals[i] = 0;
-        }
+        // int clean_tid = tid - comm_threads;
+        // for (int i = clean_tid; i < state.n_tokens; i += clean_threads)
+        // {
+        //     next_signals[i] = 0;
+        // }
     }
+    // char *token_data_send;
+    // char *token_data_recv;
+    // if (tid == 0){
+    //     for (int i=0;i<state.n_tokens;i++){
+    //         token_data_send = send_buffer + i * state.token_size;
+    //         token_data_recv = recv_buffer + i * state.token_size;
+    //         datacopy::nvshmemi_ibgda_put_nbi_thread(
+    //             (uint64_t)token_data_recv, (uint64_t)token_data_send, state.token_size, dst_pe, i, i);
+    //         // datacopy::ibgda_quiet(datacopy::ibgda_get_rc(dst_pe,i));
+    //     }
+    //     datacopy::ibgda_quiet(datacopy::ibgda_get_rc(dst_pe,0));
+    // }
 }
