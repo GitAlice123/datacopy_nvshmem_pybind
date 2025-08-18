@@ -67,7 +67,6 @@ std::vector<uint8_t> get_unique_id()
     return result;
 }
 
-// 实现 DoubleBufferManager 的方法
 DoubleBufferManager::DoubleBufferManager() : initialized(false), n_tokens(0), token_size(0) {}
 
 DoubleBufferManager::~DoubleBufferManager()
@@ -104,18 +103,14 @@ void DoubleBufferManager::test_bandwidth(int rank, int world_size)
     }
     int dst_pe = (rank == 0) ? 1 : 0;
 
-    // 计算线程配置
     int total_need_threads = n_tokens * 2;
     int block_size = 256;
     int grid_size = (total_need_threads + block_size - 1) / block_size;
 
-    // 启动内核
     send_recv_clean_kernel<<<grid_size, block_size>>>(state, dst_pe);
 
-    // 等待内核完成
     cudaDeviceSynchronize();
 
-    // 切换缓冲区
     state.current_buffer = 1 - state.current_buffer;
 }
 
@@ -125,26 +120,22 @@ void DoubleBufferManager::init_double_buffer(DoubleBufferState *state, int n_tok
     state->token_size = token_size;
     state->current_buffer = 0;
 
-    // 检查参数有效性
     if (n_tokens <= 0 || token_size <= 0)
     {
         fprintf(stderr, "Error: Invalid parameters: n_tokens=%d, token_size=%d\n", n_tokens, token_size);
         exit(EXIT_FAILURE);
     }
 
-    // 分配缓冲区0
     state->buffer0_send = (char *)nvshmem_malloc(n_tokens * token_size);
     state->buffer0_recv = (char *)nvshmem_malloc(n_tokens * token_size);
     state->buffer0_signals = (volatile int *)nvshmem_malloc(n_tokens * sizeof(int));
 
-    // 检查分配是否成功
     if (!state->buffer0_send || !state->buffer0_recv || !state->buffer0_signals)
     {
         fprintf(stderr, "Error: Failed to allocate buffer0\n");
         exit(EXIT_FAILURE);
     }
 
-    // 分配缓冲区1
     state->buffer1_send = (char *)nvshmem_malloc(n_tokens * token_size);
     state->buffer1_recv = (char *)nvshmem_malloc(n_tokens * token_size);
     state->buffer1_signals = (volatile int *)nvshmem_malloc(n_tokens * sizeof(int));
@@ -163,7 +154,6 @@ void DoubleBufferManager::init_double_buffer(DoubleBufferState *state, int n_tok
         exit(EXIT_FAILURE);
     }
 
-    // 在主机上创建临时缓冲区并初始化
     int *host_signals = (int *)malloc(n_tokens * sizeof(int));
     if (!host_signals)
     {
@@ -176,7 +166,6 @@ void DoubleBufferManager::init_double_buffer(DoubleBufferState *state, int n_tok
         host_signals[i] = 0;
     }
 
-    // 使用 cudaMemcpy 将数据从主机复制到设备
     cudaError_t err;
 
     err = cudaMemcpy((void *)state->buffer0_signals, host_signals, n_tokens * sizeof(int), cudaMemcpyHostToDevice);
@@ -200,10 +189,8 @@ void DoubleBufferManager::init_double_buffer(DoubleBufferState *state, int n_tok
         exit(EXIT_FAILURE);
     }
 
-    // 释放主机内存
     free(host_signals);
 
-    // 确保内存同步
     nvshmem_barrier_all();
 }
 
@@ -220,42 +207,35 @@ void DoubleBufferManager::cleanup_double_buffer(DoubleBufferState *state)
     nvshmem_free((void *)state->buffer_tmp_signals);
 }
 
-// 内核函数实现
 __global__ void send_recv_clean_kernel(DoubleBufferState state, int dst_pe)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int total_threads = gridDim.x * blockDim.x;
 
-    // 确定当前和下一个缓冲区
     int current_idx = state.current_buffer;
     int next_idx = 1 - current_idx;
 
-    // 获取当前缓冲区指针
     char *send_buffer = (current_idx == 0) ? state.buffer0_send : state.buffer1_send;
     char *recv_buffer = (current_idx == 0) ? state.buffer0_recv : state.buffer1_recv;
     volatile int *signals = (current_idx == 0) ? state.buffer0_signals : state.buffer1_signals;
     volatile int *signals_tmp = state.buffer_tmp_signals;
 
-    // 获取下一个缓冲区指针（用于清理）
     volatile int *next_signals = (next_idx == 0) ? state.buffer0_signals : state.buffer1_signals;
 
-    // 线程分组：前一半用于通信，后一半用于清理
     int comm_threads = total_threads / 2;
     int clean_threads = comm_threads;
 
     if (tid < comm_threads)
     {
-        // 通信线程：执行发送和接收
         if (tid < state.n_tokens) 
         {
-            // 发送数据
             char *token_data_send = send_buffer + tid * state.token_size;
             char *token_data_recv = recv_buffer + tid * state.token_size;
 
             datacopy::nvshmemi_ibgda_put_nbi_thread(
                 (uint64_t)token_data_recv, (uint64_t)token_data_send, state.token_size, dst_pe, tid, tid);
             nvshmem_fence();
-            // 发送信号
+            // send signal
             uint32_t signal = (tid << 16) | 0x0001;
             // uint32_t signal = tid + 1;
             // datacopy::nvshmemi_ibgda_amo_nonfetch_add((void *)&signals[tid], signal, dst_pe, tid, false);
@@ -308,11 +288,10 @@ __global__ void send_recv_clean_kernel(DoubleBufferState state, int dst_pe)
     }
     else
     {
-        // 清理线程：清理下一个缓冲区
         int clean_tid = tid - comm_threads;
         for (int i = clean_tid; i < state.n_tokens; i += clean_threads)
         {
-            next_signals[i] = 0; // 重置信号
+            next_signals[i] = 0;
         }
     }
 }
