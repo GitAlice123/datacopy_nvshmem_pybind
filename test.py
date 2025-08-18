@@ -72,7 +72,7 @@ def main():
 
     os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
     os.environ['NVSHMEM_DISABLE_P2P'] = '1'
-    os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
+    os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '0'
     os.environ['NVSHMEM_IBGDA_NIC_HANDLER'] = 'gpu'
     os.environ['NVSHMEM_QP_DEPTH'] = '1024'
     os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'

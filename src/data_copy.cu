@@ -232,12 +232,12 @@ __global__ void send_recv_clean_kernel(DoubleBufferState state, int dst_pe)
             char *token_data_send = send_buffer + tid * state.token_size;
             char *token_data_recv = recv_buffer + tid * state.token_size;
 
-            datacopy::nvshmemi_ibgda_put_nbi_thread(
-                (uint64_t)token_data_recv, (uint64_t)token_data_send, state.token_size, dst_pe, tid, tid);
-            // nvshmemx_int8_put_nbi_warp((uint64_t)token_data_recv,
-            //                              (uint64_t)token_data_send,
-            //                              state.token_size,
-            //                              dst_pe);
+            // datacopy::nvshmemi_ibgda_put_nbi_thread(
+            //     (uint64_t)token_data_recv, (uint64_t)token_data_send, state.token_size, dst_pe, tid, tid);
+            nvshmemx_int8_put_nbi_thread((int8_t *)token_data_recv,
+                                       (int8_t *)token_data_send,
+                                       state.token_size,
+                                       dst_pe);
             // datacopy::ibgda_quiet(datacopy::ibgda_get_rc(dst_pe,tid));
             // nvshmem_fence();
             // --------------------------------------------------------------------------------------------
@@ -248,7 +248,8 @@ __global__ void send_recv_clean_kernel(DoubleBufferState state, int dst_pe)
            
             // uint32_t signal = tid + 1;
             // datacopy::nvshmemi_ibgda_amo_nonfetch_add((void *)&signals[tid], signal, dst_pe, tid);
-            datacopy::ibgda_quiet(datacopy::ibgda_get_rc(dst_pe,tid));
+            // datacopy::ibgda_quiet(datacopy::ibgda_get_rc(dst_pe,tid));
+            nvshmem_quiet();
             // while (signals[tid] != tid + 1)
             //     ;
             // datacopy::nvshmemi_ibgda_rma_p((int *)&signals_tmp[tid], 0, dst_pe, tid);
